@@ -60,28 +60,78 @@ Roughly: 200 CVs ≈ 400 Flash calls plus one Pro call. Re-running a second job
 posting against the same pile costs half that, since parse and classify are
 cached by file hash.
 
+Every stage falls back to a deterministic heuristic (regex/keyword parsing,
+word-boundary skill matching) if the API key is missing, a call fails, or a
+quota is exhausted — the app never hard-errors. Each endpoint reports which
+path was actually taken per stage (`parse_source`, `classify_source`,
+`judge_source`, `review_source`, `rerank_source`, each `"gemini"` |
+`"heuristic"` | `"skipped"`), and the frontend renders this as a badge next
+to every AI-backed result so you can see at a glance whether a given number
+came from the model or the fallback.
+
 ## Run
+
+**Backend** (FastAPI, root of the repo):
 
 ```bash
 pip install -r requirements.txt
 sudo apt install tesseract-ocr        # scanned CVs
-export GEMINI_API_KEY=...
-uvicorn app.main:app --reload
 ```
 
+Jobs and candidates persist in Postgres. Get one running:
+
+```bash
+docker run --name cv-screening-db -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=cv_screening -p 5432:5432 -d postgres:16
 ```
-POST /jobs                      {"description": "..."} -> job_id + parsed JobSpec
-POST /cvs                       multipart batch upload
+
+Create a `.env` file in the repo root (loaded automatically via
+`python-dotenv`):
+
+```
+GEMINI_API_KEY=...
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/cv_screening
+```
+
+`DATABASE_URL` defaults to the same local connection string if unset. Tables
+(`jobs`, `candidates`) are created automatically on startup — no migration
+step yet. Without `GEMINI_API_KEY`, all stages silently run on the heuristic
+fallback — useful for offline dev, but expect lower accuracy than the model
+path.
+
+```bash
+uvicorn main:app --reload   # http://localhost:8000
+```
+
+**Frontend** (React + Vite, in `frontend/`):
+
+```bash
+cd frontend
+npm install
+npm run dev                 # http://localhost:5173
+```
+
+The dev server proxies `/api/*` to `http://localhost:8000` (see
+`vite.config.js`), so both must be running for real data; the frontend falls
+back to mock data automatically if the backend isn't reachable.
+
+```
+POST /jobs                      {"description": "..."} -> job_id + parsed JobSpec + parse_source
+POST /cvs                       multipart batch upload -> per-candidate parse_source + classify_source
+GET  /jobs                      list posted jobs, newest first, with candidate_count per field
 GET  /fields                    candidate counts per field
-GET  /jobs/{id}/ranking?n=10&field=frontend
-GET  /cvs/{id}/review?job_id=...
+GET  /jobs/{id}/ranking?n=10&field=frontend    -> ranked shortlist + rerank_source
+GET  /cvs/{id}/review?job_id=...               -> full breakdown + parse/classify/judge/review sources
 ```
+
+Jobs and candidates persist across restarts in Postgres. The ranking cache
+(per job/field/n, keyed to the exact candidate pool) is in-memory and resets
+on restart — the next request for that job just recomputes it.
 
 ## Before production
 
-- Replace the in-memory dicts with Postgres + pgvector (candidates, jobs, scores,
-  embeddings). Cache skill embeddings — the same 300 skill strings get embedded
-  on every scoring run right now.
+- Add pgvector and cache skill embeddings — the same 300 skill strings get
+  embedded on every scoring run right now.
 - Move `/cvs` onto a worker queue (arq/Celery); a 200-file upload will time out.
 - Build a labelled set of ~50 CVs with known correct field + rough ranking, and
   regression-test against it whenever you touch a prompt or a weight. Without

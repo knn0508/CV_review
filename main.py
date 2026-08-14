@@ -2,7 +2,8 @@
 GET /jobs (list, needed so the frontend can route ranking by category rather
 than by a specific job id).
 
-Storage is in-memory dicts, per the "Before production" note in README.
+Jobs and candidates persist in Postgres (see db.py) — the only in-memory
+state left is the ranking cache, which is derived and safe to lose.
 
 Model stages now call real Gemini, per README's table:
   classify              -> gemini-3.5-flash-lite
@@ -23,11 +24,14 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from extract import extract
+from db import CandidateRow, JobRow, async_session, get_session, init_db
+from extract import ExtractedDoc, extract
 from schemas import (
     CandidateProfile,
     CVReview,
@@ -82,12 +86,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- in-memory storage ----------
 
-JOBS: dict[str, JobSpec] = {}
-JOB_ORDER: list[str] = []  # insertion order, newest last
-JOB_SOURCE: dict[str, str] = {}  # job_id -> "gemini" | "heuristic"
-CANDIDATES: dict[str, dict] = {}  # file_hash -> {profile, extracted, field, full_name}
+@app.on_event("startup")
+async def _on_startup():
+    await init_db()
+
+
+# ---------- storage ----------
+# Jobs and candidates live in Postgres (db.py) so they survive a restart.
+# The ranking cache stays in-memory: it's derived from the two tables above,
+# not source data, and is invalidated the moment the candidate pool changes.
+
+RANKING_CACHE: dict[tuple, dict] = {}  # (job_id, field, n) -> {pool_key, response}
+
+
+def _job_from_row(row: JobRow) -> JobSpec:
+    return JobSpec(**row.spec)
+
+
+def _candidate_from_row(row: CandidateRow) -> dict:
+    return {
+        "file_hash": row.file_hash,
+        "profile": CandidateProfile(**row.profile),
+        "extracted": ExtractedDoc(**row.extracted),
+        "field": row.field,
+        "parse_source": row.parse_source,
+        "classify_source": row.classify_source,
+    }
+
+
+async def _field_counts(db: AsyncSession) -> dict[str, int]:
+    rows = await db.execute(select(CandidateRow.field, func.count()).group_by(CandidateRow.field))
+    return dict(rows.all())
 
 FIELD_KEYWORDS: dict[Field_, list[str]] = {
     "frontend": ["react", "vue", "angular", "css", "html", "frontend", "typescript", "javascript", "next.js"],
@@ -485,7 +515,7 @@ class _RerankOrder(BaseModel):
     ordered_candidate_ids: list[str]
 
 
-async def _rerank(job: JobSpec, shortlist: list[ScoreBreakdown]) -> tuple[list[ScoreBreakdown], str]:
+async def _rerank(job: JobSpec, shortlist: list[ScoreBreakdown], candidates: dict[str, dict]) -> tuple[list[ScoreBreakdown], str]:
     """Gemini 3.1 Pro sees the whole shortlist side-by-side in one call and
     returns a relative order — per README, relative comparison is far more
     stable than independent absolute scoring."""
@@ -494,7 +524,7 @@ async def _rerank(job: JobSpec, shortlist: list[ScoreBreakdown]) -> tuple[list[S
     try:
         lines = []
         for s in shortlist:
-            cv = CANDIDATES[s.candidate_id]
+            cv = candidates[s.candidate_id]
             profile = cv["profile"]
             lines.append(
                 f"- id={s.candidate_id} | {profile.full_name or 'Unknown'} | score={s.total} | "
@@ -566,33 +596,31 @@ async def _score(job: JobSpec, profile: CandidateProfile, cv: dict) -> tuple[Sco
 # ---------- endpoints ----------
 
 @app.post("/jobs")
-async def post_job(body: JobIn):
+async def post_job(body: JobIn, db: AsyncSession = Depends(get_session)):
     description = body.description
     if not description.strip():
         raise HTTPException(400, "description is required")
     job, source = await _parse_job(description)
     job_id = f"job_{uuid.uuid4().hex[:8]}"
-    JOBS[job_id] = job
-    JOB_ORDER.append(job_id)
-    JOB_SOURCE[job_id] = source
+    db.add(JobRow(job_id=job_id, field=job.field, spec=job.model_dump(), parse_source=source))
+    await db.commit()
     return {"job_id": job_id, **job.model_dump(), "parse_source": source}
 
 
 @app.get("/jobs")
-async def list_jobs():
+async def list_jobs(db: AsyncSession = Depends(get_session)):
     """Not in README's original 5 endpoints — added so the frontend can offer
     a category picker instead of requiring a specific job id up front."""
-    counts: dict[str, int] = {}
-    for cv in CANDIDATES.values():
-        counts[cv["field"]] = counts.get(cv["field"], 0) + 1
+    rows = (await db.execute(select(JobRow).order_by(JobRow.created_at.desc()))).scalars().all()
+    counts = await _field_counts(db)
     return [
         {
-            "job_id": jid,
-            **JOBS[jid].model_dump(),
-            "candidate_count": counts.get(JOBS[jid].field, 0),
-            "parse_source": JOB_SOURCE.get(jid, "heuristic"),
+            "job_id": row.job_id,
+            **row.spec,
+            "candidate_count": counts.get(row.field, 0),
+            "parse_source": row.parse_source,
         }
-        for jid in reversed(JOB_ORDER)
+        for row in rows
     ]
 
 
@@ -604,26 +632,35 @@ async def _ingest_one(f: UploadFile, tmp: Path) -> dict | None:
     except ValueError:
         return None
 
-    if doc.file_hash not in CANDIDATES:
-        profile, parse_source = await _parse_cv(doc.text)
-        prediction, classify_source = await _classify(profile)
-        CANDIDATES[doc.file_hash] = {
-            "file_hash": doc.file_hash,
-            "profile": profile,
-            "extracted": doc,
-            "field": prediction.primary,
-            "parse_source": parse_source,
-            "classify_source": classify_source,
-        }
-    cv = CANDIDATES[doc.file_hash]
+    # own session per task: an AsyncSession isn't safe to share across
+    # concurrently-running coroutines in asyncio.gather.
+    async with async_session() as db:
+        existing = await db.get(CandidateRow, doc.file_hash)
+        if existing is None:
+            profile, parse_source = await _parse_cv(doc.text)
+            prediction, classify_source = await _classify(profile)
+            row = CandidateRow(
+                file_hash=doc.file_hash,
+                filename=f.filename or "upload",
+                field=prediction.primary,
+                profile=profile.model_dump(),
+                extracted=doc.__dict__,
+                parse_source=parse_source,
+                classify_source=classify_source,
+            )
+            db.add(row)
+            await db.commit()
+            existing = row
+
+    cv = _candidate_from_row(existing)
     return {
-        "candidate_id": doc.file_hash,
+        "candidate_id": cv["file_hash"],
         "filename": f.filename,
         "full_name": cv["profile"].full_name,
         "field": cv["field"],
         "parse_source": cv["parse_source"],
         "classify_source": cv["classify_source"],
-        "flagged": doc.injection_flag,
+        "flagged": cv["extracted"].injection_flag,
     }
 
 
@@ -641,20 +678,30 @@ async def post_cvs(files: list[UploadFile]):
 
 
 @app.get("/fields")
-async def get_fields():
-    counts: dict[str, int] = {}
-    for cv in CANDIDATES.values():
-        counts[cv["field"]] = counts.get(cv["field"], 0) + 1
-    return counts
+async def get_fields(db: AsyncSession = Depends(get_session)):
+    return await _field_counts(db)
 
 
 @app.get("/jobs/{job_id}/ranking")
-async def get_ranking(job_id: str, n: int = 10, field: str | None = None):
-    job = JOBS.get(job_id)
-    if not job:
+async def get_ranking(job_id: str, n: int = 10, field: str | None = None, db: AsyncSession = Depends(get_session)):
+    job_row = await db.get(JobRow, job_id)
+    if not job_row:
         raise HTTPException(404, "job not found")
+    job = _job_from_row(job_row)
 
-    pool = [cv for cv in CANDIDATES.values() if not field or cv["field"] == field]
+    query = select(CandidateRow)
+    if field:
+        query = query.where(CandidateRow.field == field)
+    rows = (await db.execute(query)).scalars().all()
+    pool = [_candidate_from_row(row) for row in rows]
+    candidates_by_id = {cv["file_hash"]: cv for cv in pool}
+
+    pool_key = frozenset(candidates_by_id)
+    cache_key = (job_id, field, n)
+    cached = RANKING_CACHE.get(cache_key)
+    if cached and cached["pool_key"] == pool_key:
+        return cached["response"]
+
     scored_pairs = await asyncio.gather(*(_score(job, cv["profile"], cv) for cv in pool))
     judge_source_by_id = {b.candidate_id: src for b, src in scored_pairs}
     scored = sorted((b for b, _ in scored_pairs), key=lambda s: s.total, reverse=True)
@@ -662,12 +709,12 @@ async def get_ranking(job_id: str, n: int = 10, field: str | None = None):
     # cheap score cuts the pile to ~2N, then one Pro call orders that
     # shortlist relatively — see README's "rank relatively, score absolutely"
     shortlist = scored[: max(n * 2, n)]
-    reranked, rerank_source = await _rerank(job, shortlist)
+    reranked, rerank_source = await _rerank(job, shortlist, candidates_by_id)
     final = reranked[:n]
 
     results = []
     for s in final:
-        cv = CANDIDATES[s.candidate_id]
+        cv = candidates_by_id[s.candidate_id]
         results.append({
             "candidate_id": s.candidate_id,
             "full_name": cv["profile"].full_name or "Unknown candidate",
@@ -684,20 +731,24 @@ async def get_ranking(job_id: str, n: int = 10, field: str | None = None):
             "classify_source": cv["classify_source"],
             "injection_flag": s.injection_flag,
         })
-    return {
+    response = {
         "job_id": job_id,
         "job": {"job_id": job_id, **job.model_dump()},
         "rerank_source": rerank_source,
         "results": results,
     }
+    RANKING_CACHE[cache_key] = {"pool_key": pool_key, "response": response}
+    return response
 
 
 @app.get("/cvs/{cv_id}/review")
-async def get_review(cv_id: str, job_id: str):
-    job = JOBS.get(job_id)
-    cv = CANDIDATES.get(cv_id)
-    if not job or not cv:
+async def get_review(cv_id: str, job_id: str, db: AsyncSession = Depends(get_session)):
+    job_row = await db.get(JobRow, job_id)
+    cv_row = await db.get(CandidateRow, cv_id)
+    if not job_row or not cv_row:
         raise HTTPException(404, "job or candidate not found")
+    job = _job_from_row(job_row)
+    cv = _candidate_from_row(cv_row)
 
     breakdown, judge_source = await _score(job, cv["profile"], cv)
     narrative, review_source = await _review_narrative(job, cv["profile"], breakdown)

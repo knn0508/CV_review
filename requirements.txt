@@ -9,8 +9,8 @@ python-docx>=1.1
 pytesseract>=0.3.13
 pillow>=10.4
 numpy>=2.0
-# production: postgres + vector storage + queue
 sqlalchemy>=2.0
-pgvector>=0.3
 psycopg[binary]>=3.2
+# future: embeddings + worker queue
+pgvector>=0.3
 arq>=0.26
